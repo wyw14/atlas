@@ -793,6 +793,22 @@ func (e *Executor) Pending(ctx context.Context) ([]File, error) {
 // Execute executes the given migration file on the database. If it sees a file, that has been partially applied, it
 // will continue with the next statement in line.
 func (e *Executor) Execute(ctx context.Context, m File) (err error) {
+	// Parse file-level atlas:assert directives before any database interaction.
+	// Malformed directives fail before the first revision write or business statement.
+	asserts, err := e.fileAsserts(m)
+	if err != nil {
+		e.log.Log(LogError{Error: err})
+		return err
+	}
+	// Assertion text is covered by the migration file checksum. Files that opt
+	// out of the checksum must not silently acquire a "verified assertion" state.
+	if len(asserts) > 0 {
+		if lf, ok := m.(*LocalFile); ok && lf.sumIgnored() {
+			err = &AssertChecksumError{File: m.Name()}
+			e.log.Log(LogError{Error: err})
+			return err
+		}
+	}
 	hf, err := e.dir.Checksum()
 	if err != nil {
 		return fmt.Errorf("sql/migrate: compute hash: %w", err)
@@ -835,6 +851,26 @@ func (e *Executor) Execute(ctx context.Context, m File) (err error) {
 			Hash:        hash,
 		}
 	}
+	if len(asserts) > 0 {
+		// A file carrying assertions cannot be auto-recovered from a partial
+		// execution: its assertions depend on the initial database state and
+		// must neither be re-run silently against a mutated state nor skipped.
+		if r.Applied > 0 {
+			err = &AssertRecoveryError{File: m.Name(), Applied: r.Applied, Total: r.Total}
+			e.log.Log(LogError{Error: err})
+			return err
+		}
+		// Emit the file entry before the check group so loggers can attach the
+		// assertion results to it. No revision has been written at this point.
+		e.log.Log(LogFile{m, r.Version, r.Description, r.Applied})
+		// Run assertions on the executor's bound handle, in declaration order,
+		// before the first revision write and before any business statement.
+		// On failure, return without writing a revision or executing file SQL.
+		if err = e.runAsserts(ctx, m, asserts); err != nil {
+			e.log.Log(LogError{Error: err})
+			return err
+		}
+	}
 	// Save once to mark as started in the database.
 	if err = e.writeRevision(ctx, r); err != nil {
 		e.log.Log(LogError{Error: err})
@@ -859,7 +895,11 @@ func (e *Executor) Execute(ctx context.Context, m File) (err error) {
 			}
 		}
 	}
-	e.log.Log(LogFile{m, r.Version, r.Description, r.Applied})
+	// Files with assertions already emitted the LogFile entry before their
+	// pre-execution checks ran.
+	if len(asserts) == 0 {
+		e.log.Log(LogFile{m, r.Version, r.Description, r.Applied})
+	}
 	if err := e.fileChecks(ctx, m, r); err != nil {
 		e.log.Log(LogError{Error: err})
 		r.done()

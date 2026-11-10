@@ -271,7 +271,10 @@ const (
 	directiveDelimiter = "delimiter"
 	// atlas:checkpoint directive.
 	directiveCheckpoint = "checkpoint"
-	directivePrefixSQL  = "-- "
+	// atlas:assert directive. File-level pre-execution assertions that must
+	// evaluate to true before any business statement of the file is executed.
+	directiveAssert    = "assert"
+	directivePrefixSQL = "-- "
 )
 
 var reDirective = regexp.MustCompile(`^([ -~]*)atlas:(\w+)(?: +(.+))*`)
@@ -350,6 +353,18 @@ func (f *LocalFile) comments() []string {
 		return nil
 	}
 	return comments
+}
+
+// AssertDirectives returns the file-level atlas:assert directive arguments in
+// declaration order. Each argument holds the assertion query declared by the user.
+func (f *LocalFile) AssertDirectives() []string {
+	return f.Directive(directiveAssert)
+}
+
+// sumIgnored reports whether the file opts out of the migration
+// directory checksum via an "atlas:sum ignore" file directive.
+func (f *LocalFile) sumIgnored() bool {
+	return slices.Contains(f.Directive(directiveSum), sumModeIgnore)
 }
 
 type (
