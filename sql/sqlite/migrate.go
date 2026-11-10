@@ -7,6 +7,7 @@ package sqlite
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -108,12 +109,13 @@ func (s *state) addTable(ctx context.Context, add *schema.AddTable) error {
 	}
 	b.WrapIndent(func(b *sqlx.Builder) {
 		b.MapIndent(add.T.Columns, func(i int, b *sqlx.Builder) {
-			if err := s.column(b, add.T.Columns[i]); err != nil {
+			if err := s.column(b, add.T, add.T.Columns[i]); err != nil {
 				errs = append(errs, err.Error())
 			}
 		})
-		// Primary keys with auto-increment are inlined on the column definition.
-		if pk := add.T.PrimaryKey; pk != nil && !autoincPK(pk) {
+		// Primary keys with auto-increment, or the historical inlined
+		// "INTEGER PRIMARY KEY DESC" quirk, are rendered on the column definition.
+		if pk := add.T.PrimaryKey; pk != nil && !autoincPK(pk) && !descRowidPK(add.T) {
 			b.Comma().NL().P("PRIMARY KEY")
 			s.indexParts(b, pk.Parts)
 		}
@@ -198,11 +200,20 @@ func (s *state) modifyTable(ctx context.Context, modify *schema.ModifyTable) err
 	indexes := newT.Indexes
 	newT.Indexes = nil
 	newT.Name = "new_" + newT.Name
+	// Resolve how the hidden rowid (if any) is preserved before emitting
+	// any statement, so that an unresolvable case fails the plan without
+	// creating a temporary table or dropping the original one. ModifyTable.T
+	// carries the target shape, so the source table shape is reconstructed
+	// from the column and attribute changes.
+	fromRef, toRef, copyRowID, err := rowidCopyPlan(sourceRowidTable(modify.T, modify.Changes), &newT)
+	if err != nil {
+		return err
+	}
 	// Create a new table with a temporary name, and copy the existing rows to it.
 	if err := s.addTable(ctx, &schema.AddTable{T: &newT}); err != nil {
 		return err
 	}
-	copied, err := s.copyRows(modify.T, &newT, modify.Changes)
+	copied, err := s.copyRows(modify.T, &newT, modify.Changes, fromRef, toRef, copyRowID)
 	if err != nil {
 		return err
 	}
@@ -234,12 +245,12 @@ func (s *state) renameTable(c *schema.RenameTable) {
 	})
 }
 
-func (s *state) column(b *sqlx.Builder, c *schema.Column) error {
-	t, err := FormatType(c.Type.Type)
+func (s *state) column(b *sqlx.Builder, t *schema.Table, c *schema.Column) error {
+	tt, err := FormatType(c.Type.Type)
 	if err != nil {
 		return err
 	}
-	b.Ident(c.Name).P(t)
+	b.Ident(c.Name).P(tt)
 	if !c.Type.Null {
 		b.P("NOT")
 	}
@@ -260,6 +271,12 @@ func (s *state) column(b *sqlx.Builder, c *schema.Column) error {
 		x := &schema.GeneratedExpr{}
 		sqlx.Has(c.Attrs, x)
 		b.P("AS", sqlx.MayWrap(x.Expr), x.Type)
+	}
+	// Keep the historical "INTEGER PRIMARY KEY DESC" quirk as an inlined
+	// column constraint, otherwise an exact INTEGER column would become a
+	// rowid alias when rebuilt through a table-level primary key.
+	if t != nil && descRowidPK(t) && t.PrimaryKey.Parts[0].C == c {
+		b.P("PRIMARY KEY DESC")
 	}
 	return nil
 }
@@ -375,7 +392,7 @@ func (s *state) fks(b *sqlx.Builder, fks ...*schema.ForeignKey) {
 	})
 }
 
-func (s *state) copyRows(from *schema.Table, to *schema.Table, changes []schema.Change) (bool, error) {
+func (s *state) copyRows(from *schema.Table, to *schema.Table, changes []schema.Change, fromRowID, toRowID *rowidRef, copyRowID bool) (bool, error) {
 	var fromC, toC []string
 	for _, column := range to.Columns {
 		// Skip generated columns in INSERT as they are computed.
@@ -444,6 +461,19 @@ func (s *state) copyRows(from *schema.Table, to *schema.Table, changes []schema.
 	}
 	insert := len(toC) > 0
 	if insert {
+		// Preserve the hidden rowid of rowid tables. When the target table
+		// exposes its rowid through a declared INTEGER PRIMARY KEY alias that
+		// is already copied, feed the source rowid into the existing column
+		// position. Otherwise, prepend the resolved rowid identifiers to both
+		// column lists and let the database set the rowid explicitly.
+		if copyRowID {
+			if i := slices.Index(toC, toRowID.name); toRowID.alias && i != -1 {
+				fromC[i] = fromRowID.name
+			} else {
+				fromC = append([]string{fromRowID.name}, fromC...)
+				toC = append([]string{toRowID.name}, toC...)
+			}
+		}
 		s.append(&migrate.Change{
 			Cmd: fmt.Sprintf(
 				"INSERT INTO `%s` (%s) SELECT %s FROM `%s`",
@@ -453,6 +483,241 @@ func (s *state) copyRows(from *schema.Table, to *schema.Table, changes []schema.
 		})
 	}
 	return insert, nil
+}
+
+// rowidPseudoNames are the special case-insensitive names that can be used
+// to reference the hidden rowid of a rowid table, unless a user-defined
+// column with the same name shadows them. "_rowid_" is tried first as it is
+// the conventional escape hatch and is rarely used as a column name.
+// See: https://www.sqlite.org/lang_createtable.html#rowid.
+var rowidPseudoNames = []string{"_rowid_", "rowid", "oid"}
+
+// rePKDescColumn matches an inlined descending "INTEGER PRIMARY KEY DESC"
+// column constraint. Such a column is intentionally not made a rowid alias
+// by SQLite due to a long-standing quirk that is preserved for compatibility.
+// Note that a table-level "PRIMARY KEY (col DESC)" constraint does not carry
+// the same quirk and keeps an exact "INTEGER" column as a rowid alias.
+var rePKDescColumn = regexp.MustCompile(`(?i)integer\s+[^,()]*primary\s+key\s+desc\b`)
+
+// rowidRef describes how the hidden rowid of a rowid table can be
+// referenced while rows are copied between tables.
+type rowidRef struct {
+	// name is the identifier used in SQL to read or write the hidden rowid.
+	name string
+	// alias reports whether name is a declared INTEGER PRIMARY KEY alias
+	// column rather than one of the special rowid pseudo-columns.
+	alias bool
+}
+
+// isRowidTable reports whether the table stores a hidden rowid, i.e. it is
+// not declared with the WITHOUT ROWID option.
+// See: https://www.sqlite.org/withoutrowid.html.
+func isRowidTable(t *schema.Table) bool {
+	return !sqlx.Has(t.Attrs, &WithoutRowID{})
+}
+
+// rowidAliasColumn returns the column that is an alias for the hidden rowid,
+// or nil if the table has no such column.
+//
+// A column is a rowid alias only when the table is a rowid table, it forms a
+// single-column PRIMARY KEY declared with the exact type "INTEGER", and the
+// key is not descending. Types such as "INT" or "BIGINT" produce ordinary
+// unique keys, and "INTEGER PRIMARY KEY DESC" is a SQLite quirk that prevents
+// the alias from being created.
+// See: https://www.sqlite.org/lang_createtable.html#rowid.
+func rowidAliasColumn(t *schema.Table) *schema.Column {
+	if !isRowidTable(t) || t.PrimaryKey == nil || len(t.PrimaryKey.Parts) != 1 {
+		return nil
+	}
+	p := t.PrimaryKey.Parts[0]
+	if p.C == nil || p.Desc || !strings.EqualFold(strings.TrimSpace(p.C.Type.Raw), "integer") {
+		return nil
+	}
+	// Primary-key parts populated by inspection (pragma_table_xinfo) do not
+	// carry the sort order, so detect the descending quirk from the original
+	// CREATE statement when it is available.
+	var c CreateStmt
+	if sqlx.Has(t.Attrs, &c) && pkDescInStmt(c.S) {
+		return nil
+	}
+	return p.C
+}
+
+// pkDescInStmt reports whether the CREATE statement declares an inlined
+// descending "INTEGER PRIMARY KEY DESC" column constraint.
+func pkDescInStmt(stmt string) bool {
+	return rePKDescColumn.MatchString(stmt)
+}
+
+// descRowidPK reports whether the table has a single-column primary key that
+// must be rendered as an inlined "PRIMARY KEY DESC" column constraint. Only
+// the inlined form prevents an exact "INTEGER" column from becoming a rowid
+// alias, so rebuilding such tables must keep the same syntax to preserve
+// both the hidden rowid and the constraint semantics.
+func descRowidPK(t *schema.Table) bool {
+	if !isRowidTable(t) || t.PrimaryKey == nil || len(t.PrimaryKey.Parts) != 1 {
+		return false
+	}
+	p := t.PrimaryKey.Parts[0]
+	return p.C != nil && p.Desc && strings.EqualFold(strings.TrimSpace(p.C.Type.Raw), "integer")
+}
+
+// rowidPseudoColumn returns a special rowid name that is not shadowed by a
+// declared column of the table. Column names are case-insensitive in SQLite,
+// and a declared column named "rowid", "oid" or "_rowid_" always refers to
+// the ordinary column instead of the hidden rowid. An empty string is
+// returned when all three names are shadowed.
+func rowidPseudoColumn(t *schema.Table) string {
+	for _, name := range rowidPseudoNames {
+		if !slices.ContainsFunc(t.Columns, func(c *schema.Column) bool {
+			return strings.EqualFold(c.Name, name)
+		}) {
+			return name
+		}
+	}
+	return ""
+}
+
+// resolveRowidRef returns a reference that is guaranteed to address the
+// hidden rowid of the table rather than an ordinary declared column. It
+// returns nil for WITHOUT ROWID tables, which have no hidden rowid. An error
+// is returned when every special rowid name is shadowed by a declared column
+// and the table does not have an INTEGER PRIMARY KEY alias to fall back to.
+func resolveRowidRef(t *schema.Table) (*rowidRef, error) {
+	if !isRowidTable(t) {
+		return nil, nil
+	}
+	// A true INTEGER PRIMARY KEY alias column is the rowid itself, so prefer
+	// it over the pseudo names whenever it exists.
+	if c := rowidAliasColumn(t); c != nil {
+		return &rowidRef{name: c.Name, alias: true}, nil
+	}
+	if name := rowidPseudoColumn(t); name != "" {
+		return &rowidRef{name: name}, nil
+	}
+	return nil, fmt.Errorf(
+		"sqlite: cannot preserve rowid of table %q during rebuild: the hidden rowid names %q, %q and %q are all shadowed by declared columns and the table has no INTEGER PRIMARY KEY alias",
+		t.Name, "rowid", "oid", "_rowid_",
+	)
+}
+
+// sourceRowidTable rebuilds the rowid-relevant shape of the source table that
+// a temporary-table rebuild reads from. ModifyTable.T carries the target shape,
+// therefore added columns are removed, dropped columns are restored, renamed
+// columns are mapped back to their old names, and WITHOUT ROWID attribute
+// changes are reversed to reflect the source storage model.
+func sourceRowidTable(to *schema.Table, changes []schema.Change) *schema.Table {
+	var (
+		src   = &schema.Table{Name: to.Name}
+		cols  = make(map[string]*schema.Column)
+		rowid = isRowidTable(to)
+	)
+	for _, c := range to.Columns {
+		cols[c.Name] = c
+	}
+	for _, ch := range changes {
+		switch ch := ch.(type) {
+		case *schema.AddColumn:
+			delete(cols, ch.C.Name)
+		case *schema.DropColumn:
+			cols[ch.C.Name] = ch.C
+		case *schema.ModifyColumn:
+			// Keep the source column object, as its old type may decide
+			// whether the source primary key was a rowid alias.
+			cols[ch.From.Name] = ch.From
+		case *schema.RenameColumn:
+			delete(cols, ch.To.Name)
+			cols[ch.From.Name] = ch.From
+		case *schema.AddAttr:
+			if _, ok := ch.A.(*WithoutRowID); ok {
+				// The target became WITHOUT ROWID, hence the source had a rowid.
+				rowid = true
+			}
+		case *schema.DropAttr:
+			if _, ok := ch.A.(*WithoutRowID); ok {
+				// The target dropped WITHOUT ROWID, hence the source had no rowid.
+				rowid = false
+			}
+		}
+	}
+	for _, c := range cols {
+		src.Columns = append(src.Columns, c)
+	}
+	if !rowid {
+		src.Attrs = append(src.Attrs, &WithoutRowID{})
+		return src
+	}
+	src.PrimaryKey = sourcePrimaryKey(to, changes, cols)
+	return src
+}
+
+// sourcePrimaryKey reconstructs the primary key of the source table from the
+// target key and the primary-key/rename changes involved in a rebuild.
+func sourcePrimaryKey(to *schema.Table, changes []schema.Change, cols map[string]*schema.Column) *schema.Index {
+	for _, ch := range changes {
+		switch ch := ch.(type) {
+		case *schema.AddPrimaryKey:
+			// The key only exists in the target.
+			return nil
+		case *schema.DropPrimaryKey:
+			// The change carries the inspected source key.
+			return ch.P
+		}
+	}
+	if to.PrimaryKey == nil {
+		return nil
+	}
+	pk := *to.PrimaryKey
+	pk.Parts = append([]*schema.IndexPart(nil), to.PrimaryKey.Parts...)
+	for i, p := range pk.Parts {
+		if p.C == nil {
+			continue
+		}
+		name := p.C.Name
+		for _, ch := range changes {
+			if r, ok := ch.(*schema.RenameColumn); ok && r.To.Name == name {
+				name = r.From.Name
+			}
+		}
+		c, ok := cols[name]
+		if !ok {
+			// The key column did not exist in the source table.
+			return nil
+		}
+		part := *p
+		part.C = c
+		pk.Parts[i] = &part
+	}
+	return &pk
+}
+
+// rowidCopyPlan decides whether and how the hidden rowid must be copied
+// explicitly while a table is rebuilt. The returned references are resolved
+// independently for the source and target tables because declared columns may
+// shadow different rowid names on each side.
+//
+// No copy is planned when either table is WITHOUT ROWID (storage models
+// differ, or both tables keep their explicit primary key), or when both
+// tables expose a true INTEGER PRIMARY KEY alias column that is already
+// transferred by the regular declared-column mapping.
+func rowidCopyPlan(from, to *schema.Table) (fromRef, toRef *rowidRef, copy bool, err error) {
+	if fromRef, err = resolveRowidRef(from); err != nil {
+		return nil, nil, false, err
+	}
+	if toRef, err = resolveRowidRef(to); err != nil {
+		return nil, nil, false, err
+	}
+	// At least one side has no hidden rowid: never reference a column that
+	// does not exist on the other storage model.
+	if fromRef == nil || toRef == nil {
+		return fromRef, toRef, false, nil
+	}
+	// Both alias columns are copied as declared columns, hence inserting
+	// their values already restores the rowid identity without extra SQL.
+	if fromRef.alias && toRef.alias {
+		return fromRef, toRef, false, nil
+	}
+	return fromRef, toRef, true, nil
 }
 
 // alterTable alters the table with the given changes. Assuming the changes are "alterable".
@@ -477,7 +742,7 @@ func (s *state) alterTable(modify *schema.ModifyTable) error {
 		case *schema.AddColumn:
 			b := s.Build("ALTER TABLE").Ident(modify.T.Name)
 			r := b.Clone()
-			if err := s.column(b.P("ADD COLUMN"), change.C); err != nil {
+			if err := s.column(b.P("ADD COLUMN"), nil, change.C); err != nil {
 				return err
 			}
 			s.append(&migrate.Change{

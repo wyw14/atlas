@@ -217,7 +217,7 @@ func TestPlanChanges(t *testing.T) {
 				Changes: []*migrate.Change{
 					{Cmd: "PRAGMA foreign_keys = off"},
 					{Cmd: "CREATE TABLE `new_users` (`id` bigint NOT NULL, `name` text NOT NULL DEFAULT (NOW()::TEXT))", Reverse: "DROP TABLE `new_users`"},
-					{Cmd: "INSERT INTO `new_users` (`id`) SELECT `id` FROM `users`"},
+					{Cmd: "INSERT INTO `new_users` (`_rowid_`, `id`) SELECT `_rowid_`, `id` FROM `users`"},
 					{Cmd: "DROP TABLE `users`"},
 					{Cmd: "ALTER TABLE `new_users` RENAME TO `users`"},
 					{Cmd: "PRAGMA foreign_keys = on"},
@@ -280,7 +280,7 @@ func TestPlanChanges(t *testing.T) {
 				Changes: []*migrate.Change{
 					{Cmd: "PRAGMA foreign_keys = off"},
 					{Cmd: "CREATE TABLE `new_users` (`id` bigint NOT NULL, `name` text NOT NULL, `nid` bigint NOT NULL AS (1) STORED)", Reverse: "DROP TABLE `new_users`"},
-					{Cmd: "INSERT INTO `new_users` (`id`, `name`) SELECT `id`, `uname` FROM `users`"},
+					{Cmd: "INSERT INTO `new_users` (`_rowid_`, `id`, `name`) SELECT `_rowid_`, `id`, `uname` FROM `users`"},
 					{Cmd: "DROP TABLE `users`"},
 					{Cmd: "ALTER TABLE `new_users` RENAME TO `users`"},
 					{Cmd: "PRAGMA foreign_keys = on"},
@@ -330,7 +330,7 @@ func TestPlanChanges(t *testing.T) {
 				Changes: []*migrate.Change{
 					{Cmd: "PRAGMA foreign_keys = off"},
 					{Cmd: "CREATE TABLE `new_users` (`id` bigint NOT NULL, `rank` int NOT NULL DEFAULT 1, `nick` text NOT NULL DEFAULT 'a8m', `expr` text NOT NULL DEFAULT (hex(1)), CHECK (id <> 0))", Reverse: "DROP TABLE `new_users`"},
-					{Cmd: "INSERT INTO `new_users` (`id`, `rank`, `nick`, `expr`) SELECT `id`, IFNULL(`rank`, 1) AS `rank`, IFNULL(`nick`, 'a8m') AS `nick`, `expr` FROM `users`"},
+					{Cmd: "INSERT INTO `new_users` (`_rowid_`, `id`, `rank`, `nick`, `expr`) SELECT `_rowid_`, `id`, IFNULL(`rank`, 1) AS `rank`, IFNULL(`nick`, 'a8m') AS `nick`, `expr` FROM `users`"},
 					{Cmd: "DROP TABLE `users`"},
 					{Cmd: "ALTER TABLE `new_users` RENAME TO `users`"},
 					{Cmd: "PRAGMA foreign_keys = on"},

@@ -46,7 +46,28 @@ func (i *inspect) columns(ctx context.Context, t *schema.Table) error {
 			return fmt.Errorf("sqlite: %w", err)
 		}
 	}
-	return autoinc(t)
+	if err := autoinc(t); err != nil {
+		return err
+	}
+	detectPKDesc(t)
+	return nil
+}
+
+// detectPKDesc marks a single-column primary key as descending when the
+// CREATE statement uses the inlined "INTEGER PRIMARY KEY DESC" column
+// constraint. pragma_table_xinfo does not expose the sort order of
+// primary-key parts. The marked column is not made a rowid alias by SQLite
+// (a preserved historical quirk), so the flag is required to plan
+// rowid-preserving rebuilds correctly. A table-level "PRIMARY KEY (col DESC)"
+// constraint keeps the rowid-alias behavior and is intentionally not matched.
+func detectPKDesc(t *schema.Table) {
+	if t.PrimaryKey == nil || len(t.PrimaryKey.Parts) != 1 || t.PrimaryKey.Parts[0].C == nil {
+		return
+	}
+	var c CreateStmt
+	if sqlx.Has(t.Attrs, &c) && pkDescInStmt(c.S) {
+		t.PrimaryKey.Parts[0].Desc = true
+	}
 }
 
 // addColumn scans the current row and adds a new column from it to the table.
